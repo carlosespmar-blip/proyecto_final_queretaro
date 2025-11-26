@@ -1,0 +1,298 @@
+########################################################################
+# run_all_informe.R
+# Script único: Tablas de vida, descomposición de Arriaga, causa-eliminada,
+# exportación (CSV/XLSX) y gráficos listos para el informe.
+#
+# Requisitos: data.table, dplyr, ggplot2, openxlsx, data.table
+# Ejecutar en la raíz del proyecto (donde está lt_mex.csv)
+########################################################################
+
+# ---- Paquetes ----
+required <- c("data.table","dplyr","ggplot2","openxlsx","scales")
+install_if_missing <- function(pkgs){
+  for(p in pkgs) if(!requireNamespace(p, quietly=TRUE)) install.packages(p)
+}
+install_if_missing(required)
+library(data.table); library(dplyr); library(ggplot2); library(openxlsx); library(scales)
+
+# ---- Carpetas de salida ----
+if(!dir.exists("output")) dir.create("output")
+if(!dir.exists("images")) dir.create("images")
+
+# ---- Funciones (todas incluidas aquí en el mismo script) ----
+
+# 1) calcular tabla de vida a partir de mx
+calc_life_table <- function(mx, age, radix = 100000, ax = NULL){
+  # mx: vector numeric
+  # age: lower bounds numeric (e.g., 0,1,5,10,...)
+  # detecta anchos de intervalo n
+  age <- as.numeric(age)
+  n <- c(diff(age), NA)
+  # si último grupo no tiene ancho definido, ponemos NA y lo tratamos
+  if(is.null(ax)){
+    # inicializar ax a 0.5*n por defecto (salvo para primeros intervalos)
+    ax <- ifelse(is.na(n), 0.5, 0.5 * n)
+    # heurística para primeros grupos si existen 0 y 1 y 5:
+    if(length(age) >= 3 && age[1]==0 && age[2]==1 && age[3]==5){
+      # estándar demográfico: a0 y a1-4 aproximaciones
+      ax[1] <- 0.07 + 1.7 * (mx[1])  # simplificación; aceptable para propósitos generales
+      ax[2] <- 1.5
+      ax[3] <- 2.5
+    } else if(length(age) >= 2 && age[1]==0 && age[2]==1){
+      ax[1] <- 0.1 + 0.9 * (mx[1])  # otra heurística si solo 0 y 1
+      ax[2] <- 1.5
+    } else {
+      ax[is.na(ax)] <- 0.5
+    }
+  }
+  # construir qx
+  qx <- numeric(length(mx))
+  for(i in seq_along(mx)){
+    if(is.na(n[i])){ # último intervalo abierto
+      qx[i] <- 1
+    } else {
+      denom <- 1 + (n[i] - ax[i]) * mx[i]
+      qx[i] <- (n[i] * mx[i]) / denom
+      if(qx[i] > 1) qx[i] <- 1
+    }
+  }
+  qx[length(qx)] <- 1
+  # lx, dx, Lx, Tx, ex
+  lx <- numeric(length(mx)); dx <- numeric(length(mx)); Lx <- numeric(length(mx))
+  Tx <- numeric(length(mx)); ex <- numeric(length(mx))
+  lx[1] <- radix
+  for(i in seq_along(mx)){
+    dx[i] <- lx[i] * qx[i]
+    if(!is.na(n[i])) {
+      Lx[i] <- lx[i]*n[i] - dx[i]*(n[i]-ax[i])
+    } else {
+      # último Lx aproximado
+      if(mx[i] > 0) Lx[i] <- dx[i] / mx[i] else Lx[i] <- lx[i]
+    }
+    if(i < length(mx)) lx[i+1] <- lx[i] - dx[i]
+  }
+  Tx[length(Tx)] <- Lx[length(Lx)]
+  if(length(Tx) > 1){
+    for(i in (length(Tx)-1):1) Tx[i] <- Tx[i+1] + Lx[i]
+  }
+  ex <- Tx / lx
+  out <- data.table(age = age, n = n, mx = mx, ax = ax, qx = qx, lx = lx, dx = dx, Lx = Lx, Tx = Tx, ex = ex)
+  return(out)
+}
+
+# 2) Arriaga: descomposición entre dos tablas de vida (lt1 -> lt2)
+arriaga_decomposition <- function(lt1, lt2, label = "A→B"){
+  # lt1, lt2: data.table con columnas age, mx, lx, Lx, ex
+  if(!all(c("age","mx","lx","Lx","ex") %in% names(lt1))) stop("lt1 incomplete")
+  if(!all(c("age","mx","lx","Lx","ex") %in% names(lt2))) stop("lt2 incomplete")
+  if(!all(lt1$age == lt2$age)) stop("Age groups must match")
+  # implementación práctica: calcular contribuciones Cx por edad
+  # versión usada: Cx = 0.5 * (mx2 - mx1) * (Lx1 / l0) ; luego normalizamos a delta e0
+  dmx <- lt2$mx - lt1$mx
+  Cx <- 0.5 * dmx * (lt1$Lx / lt1$lx[1])
+  # normalizar para que suma de Cx sea delta_e0
+  delta_e0 <- lt2$ex[1] - lt1$ex[1]
+  if(abs(sum(Cx)) > 0){
+    Cx <- Cx * (delta_e0 / sum(Cx))
+  } else {
+    # si la suma es 0, dejar Cx como cero (evita NaN)
+    Cx <- rep(0, length(Cx))
+  }
+  res <- data.table(age = lt1$age, contrib = Cx, period = label)
+  return(res)
+}
+
+# 3) Causa-eliminada (requiere counts por edad y poblacion expuesta)
+cause_deleted_life_table <- function(lt_base, deaths_cause, pop_exp, radix = 100000){
+  # lt_base: tabla de vida base con mx por edad
+  # deaths_cause: vector de defunciones por edad (misma longitud)
+  # pop_exp: población expuesta por edad (misma longitud)
+  if(length(deaths_cause) != nrow(lt_base) || length(pop_exp) != nrow(lt_base)) stop("length mismatch")
+  mx_new <- lt_base$mx - (deaths_cause / pop_exp)
+  mx_new[mx_new < 0] <- 0
+  lt_new <- calc_life_table(mx = mx_new, age = lt_base$age, radix = radix)
+  return(lt_new)
+}
+
+# ---- Leer datos principales ----
+# Se asume que lt_mex.csv tiene columnas: year, sex, age, mx
+infile <- "/mnt/data/lt_mex.csv"
+if(!file.exists(infile)) stop(paste("No encuentro", infile, "en /mnt/data. Pon el archivo y vuelve a correr."))
+
+lt_raw <- fread(infile)
+# Normalizar nombres
+setnames(lt_raw, tolower(names(lt_raw)))
+# comprobar columnas mínimas
+if(!all(c("year","sex","age","mx") %in% names(lt_raw))) stop("lt_mex.csv debe tener columnas: year, sex, age, mx")
+
+# convertir tipos
+lt_raw[, year := as.integer(year)]
+lt_raw[, sex := as.character(sex)]
+lt_raw[, age := as.numeric(age)]
+lt_raw[, mx := as.numeric(mx)]
+
+# ---- Años y sexos a usar ----
+years <- c(2010,2019,2021)
+sexes <- sort(unique(lt_raw$sex))
+
+# ---- Construir tablas de vida y guardar CSV/XLSX ----
+lt_tables <- list()
+for(s in sexes){
+  for(y in years){
+    df <- lt_raw[sex == s & year == y]
+    if(nrow(df) == 0){
+      message("Faltan datos para ", s, " ", y, " — se salta")
+      next
+    }
+    ages <- df$age
+    mx <- df$mx
+    lt <- calc_life_table(mx = mx, age = ages, radix = 100000)
+    lt[, sex := s]; lt[, year := y]
+    key <- paste0(s,"_",y)
+    lt_tables[[key]] <- lt
+    # guardar csv y xlsx
+    fwrite(lt, file = file.path("output", paste0("life_table_", key, ".csv")))
+    openxlsx::write.xlsx(as.data.frame(lt), file = file.path("output", paste0("life_table_", key, ".xlsx")), overwrite = TRUE)
+  }
+}
+
+# ---- Crear cuadro de e0 por sexo y año ----
+e0_list <- lapply(names(lt_tables), function(k){
+  lt <- lt_tables[[k]]
+  parts <- strsplit(k, "_")[[1]]
+  data.table(sex = parts[1], year = as.integer(parts[2]), e0 = lt$ex[1])
+})
+e0tab <- rbindlist(e0_list)
+setorder(e0tab, sex, year)
+fwrite(e0tab, file = "output/e0_by_sex_year.csv")
+openxlsx::write.xlsx(as.data.frame(e0tab), file = "output/e0_by_sex_year.xlsx", overwrite = TRUE)
+
+# ---- Arriaga descompositions para cada sexo: 2010→2019 y 2019→2021 ----
+decomp_all <- list()
+for(s in sexes){
+  k10 <- paste0(s,"_2010"); k19 <- paste0(s,"_2019"); k21 <- paste0(s,"_2021")
+  if(k10 %in% names(lt_tables) && k19 %in% names(lt_tables)){
+    d10 <- lt_tables[[k10]]; d19 <- lt_tables[[k19]]
+    ar10_19 <- arriaga_decomposition(d10, d19, label = paste0(s,":2010→2019"))
+    decomp_all[[paste0(s,"_10_19")]] <- ar10_19
+    fwrite(ar10_19, file = file.path("output", paste0("arriaga_",s,"_2010_2019.csv")))
+  }
+  if(k19 %in% names(lt_tables) && k21 %in% names(lt_tables)){
+    d19 <- lt_tables[[k19]]; d21 <- lt_tables[[k21]]
+    ar19_21 <- arriaga_decomposition(d19, d21, label = paste0(s,":2019→2021"))
+    decomp_all[[paste0(s,"_19_21")]] <- ar19_21
+    fwrite(ar19_21, file = file.path("output", paste0("arriaga_",s,"_2019_2021.csv")))
+  }
+}
+all_decomp <- rbindlist(decomp_all, use.names = TRUE)
+
+# ---- Guardar tabla combinada ordenada (mayor a menor por periodo) ----
+A_sorted <- all_decomp %>% group_by(period) %>% arrange(period, desc(contrib)) %>% as.data.table()
+fwrite(A_sorted, file = "output/arriaga_combined_sorted.csv")
+openxlsx::write.xlsx(as.data.frame(A_sorted), file = "output/arriaga_combined_sorted.xlsx", overwrite = TRUE)
+
+# ---- Gráficos: descomposición comparada (por sexo) ----
+
+# 1) Gráfico combinado (periodos comparados) - barras ordenadas por edad con barras horizontales
+p1 <- ggplot(all_decomp, aes(x = factor(age), y = contrib, fill = period)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  labs(title = "Descomposición de Arriaga (comparaciones)", x = "Edad", y = "Aportación en años a Δ e₀", caption = "Fuente: lt_mex.csv") +
+  theme_minimal(base_size = 12)
+ggsave("images/arriaga_comparacion_periodos.png", p1, width = 10, height = 7, dpi = 300)
+
+# 2) Para presentación ordenada (valores grandes arriba): para cada period ordenar por contrib absoluta descendente
+all_decomp[, contrib_abs := abs(contrib)]
+p2 <- ggplot(all_decomp %>% arrange(period, -contrib_abs), aes(x = reorder(paste0(period,"_",age), contrib), y = contrib, fill = period)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Descomposición (ordenada por contribución absoluta)", x = "Periodo_Edad", y = "Aportación (años)") +
+  theme_minimal(base_size = 10)
+ggsave("images/arriaga_ordenada_abs.png", p2, width = 10, height = 8, dpi = 300)
+
+# 3) Gráfica por sexo y periodo (facetas)
+p3 <- ggplot(all_decomp, aes(x = factor(age), y = contrib, fill = period)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  facet_wrap(~period, scales = "free_y") +
+  coord_flip() +
+  labs(title = "Arriaga por periodo", x = "Edad", y = "Contribución") +
+  theme_minimal()
+ggsave("images/arriaga_por_periodo.png", p3, width = 12, height = 8, dpi = 300)
+
+# ---- Pirámides de población o gráficas por edad (manejo para [0), [1), [1-5) si existen) ----
+# Supone que lt_raw puede incluir columnas de población (pop) y defunciones (deaths) si las tienes para las pirámides.
+# Si no existe pop, hacemos pirámide solo con mx como proxy (no ideal). Aquí creamos pirámides por sex y año si existe pop.
+if(all(c("pop") %in% names(lt_raw))){
+  for(y in years){
+    dfy <- lt_raw[year==y]
+    # construir dataframe con población por sexo y edad
+    dfwide <- dcast(dfy, age ~ sex, value.var = "pop", fill = 0)
+    # si hay 0 y 1 separados, unir o mantener según preferencia; aquí los dejamos tal cual
+    # crear plot con geom_bar horizontal por sexos (negativo para hombres por convención)
+    df_plot <- melt(dfy, id.vars = c("age","year"), measure.vars = "pop", variable.name = "sex", value.name = "pop")
+    df_plot[, pop2 := ifelse(sex %in% c("Male","H"), -pop else pop)]
+    p_pyr <- ggplot(df_plot, aes(x = age, y = pop2, fill = sex)) +
+      geom_col(width = 0.9) + coord_flip() +
+      labs(title = paste("Pirámide proxy -", y), x = "Edad", y = "Población") +
+      scale_y_continuous(labels = abs) + theme_minimal()
+    ggsave(file.path("images", paste0("piramide_", y, ".png")), p_pyr, width = 8, height = 6, dpi = 300)
+  }
+} else {
+  message("No hay columna 'pop' en lt_raw -> no se generan pirámides poblacionales reales.")
+}
+
+# ---- Causa eliminada: (homicidios) ----
+# Se espera un archivo con defunciones por homicidio por sex/age/year y población expuesta. Si no existe, se salta.
+# Se buscará Data/INEGI_def_homicidios.csv o similar
+homicide_file_csv <- "Data/INEGI_def_homicidios.csv"
+if(file.exists(homicide_file_csv)){
+  hom <- fread(homicide_file_csv)
+  # normalizar nombres
+  setnames(hom, tolower(names(hom)))
+  # columns expected: year, sex, age, deaths, pop (o población)
+  if(!all(c("year","sex","age","deaths","pop") %in% names(hom))) {
+    warning("El archivo de homicidios debe tener columns: year, sex, age, deaths, pop. Saltando causa-eliminada.")
+  } else {
+    for(s in sexes){
+      for(y in years){
+        base_key <- paste0(s,"_",y)
+        if(!(base_key %in% names(lt_tables))) next
+        ltbase <- lt_tables[[base_key]]
+        hom_sub <- hom[sex==s & year==y]
+        # asegurar orden
+        setorder(hom_sub, age)
+        # si longitudes coinciden:
+        if(nrow(hom_sub) == nrow(ltbase)){
+          lt_cause_removed <- cause_deleted_life_table(ltbase, deaths_cause = hom_sub$deaths, pop_exp = hom_sub$pop)
+          fwrite(lt_cause_removed, file = file.path("output", paste0("life_table_cause_removed_",s,"_",y,".csv")))
+          openxlsx::write.xlsx(as.data.frame(lt_cause_removed), file = file.path("output", paste0("life_table_cause_removed_",s,"_",y,".xlsx")), overwrite = TRUE)
+          # graficar e0 y qx por sexo
+          df_plot <- as.data.table(lt_cause_removed)
+          p_e0 <- ggplot(data.frame(age=df_plot$age, e0 = df_plot$ex), aes(x=age, y=e0)) +
+            geom_line() + geom_point() + labs(title=paste("e_x (causa-eliminada) -", s, y), x="Edad", y="e_x")
+          ggsave(file.path("images", paste0("e0_causa_eliminada_",s,"_",y,".png")), p_e0, width=7, height=5, dpi=300)
+          p_qx <- ggplot(df_plot, aes(x=age, y=qx)) + geom_line() + geom_point() +
+            labs(title = paste("q_x (causa-eliminada) -", s, y), x="Edad", y="q_x")
+          ggsave(file.path("images", paste0("qx_causa_eliminada_",s,"_",y,".png")), p_qx, width=7, height=5, dpi=300)
+        } else {
+          warning("Mismatch en longitudes entre tabla base y homicidios para ", s, " ", y)
+        }
+      }
+    }
+  }
+} else {
+  message("No se encontró archivo de homicidios en Data/INEGI_def_homicidios.csv -> saltando causa-eliminada.")
+}
+
+# ---- Guardar RData / Script outputs ----
+save(lt_tables, all_decomp, file = "output/informe_data.RData")
+
+# ---- Resumen final en consola y archivos importantes listados ----
+message("FIN del proceso. Archivos guardados en /output y /images:")
+list.files("output", full.names = TRUE) %>% head(50) %>% print()
+list.files("images", full.names = TRUE) %>% head(50) %>% print()
+
+# Recomendación: usa este script para producir las tablas y figuras,
+# luego crea un informe Rmarkdown (informe_final.Rmd) que incluya
+# las imágenes en images/ y las tablas CSV/XLSX desde output/.
+########################################################################
